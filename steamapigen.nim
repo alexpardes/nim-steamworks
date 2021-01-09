@@ -1,10 +1,11 @@
 import compiler/[ast, idents, renderer, lineinfos, parser, options]
-import json, tables, sets, strutils
+import json, tables, sets, strutils, os
 
 
 let identCache = newIdentCache()
-var sameTypes = toHashSet(["int32", "uint32", "int64", "uint64", "void", "bool"])
 let typeMap = {
+    "bool": "bool",
+    "void": "void",
     "int": "cint",
     "unsigned int": "cuint",
     "unsigned char": "cuchar",
@@ -15,6 +16,8 @@ let typeMap = {
     "long long": "clonglong",
     "unsigned long long": "culonglong",
 }.toTable()
+
+var importedTypes: HashSet[string]
 
 
 
@@ -36,13 +39,13 @@ proc ident(name: string): PNode =
     newIdentNode(getIdent(name), lineInfo)
 
 proc nimTypeName(typeName: string): string =
-    if typeName in sameTypes:
+    if typeName in importedTypes:
         typeName
     elif typeName in typeMap:
         typeMap[typeName]
     else:
-        # raise newException(Exception, "Unknown type: " & typeName)
         typeName
+        # raise newException(Exception, "Unknown type: " & typeName)
 
 proc nimType(typeName: string): PNode
 
@@ -60,7 +63,6 @@ proc arrayType(typeStr: string): PNode =
     else:
         nil
 
-
 proc procType(returnTypeStr: string, paramTypeNames: openArray[string]): PNode =
     let defs = newNode(nkIdentDefs)
     for typeName in paramTypeNames:
@@ -74,7 +76,6 @@ proc procType(returnTypeStr: string, paramTypeNames: openArray[string]): PNode =
     result = newNode(nkProcTy)
     result.add(params)
     result.add(empty())
-
 
 proc procType(typeStr: string): PNode =
     # e.g.
@@ -132,15 +133,62 @@ proc newTypedef(aliasName: string, typeName: string): PNode =
     result.add(empty())
     result.add(nimType(typeName))
 
+proc createStructDef(structDef: JsonNode): PNode =
+    let typeName = structDef["struct"].str
+    let recList = newNode(nkRecList)
+    for fieldDef in structDef["fields"]:
+        let defs = newNode(nkIdentDefs)
+        defs.add(ident(fieldDef["fieldname"].str))
+        defs.add(nimType(fieldDef["fieldtype"].str))
+        defs.add(empty())
+        recList.add(defs)
+
+    let objectTy = newNode(nkObjectTy)
+    objectTy.add(empty())
+    objectTy.add(empty())
+    objectTy.add(recList)
+    result = newNode(nkTypeDef)
+    result.add(ident(typeName))
+    result.add(empty())
+    result.add(objectTy)
+
+proc createTypeDef(typedef: JsonNode): PNode =
+    let typeName = typedef["typedef"].str
+    importedTypes.incl(typeName)
+    newTypedef(typeName, typedef["type"].str)
+
+proc printTree(ast: PNode, indentLevel: int = 0) =
+    var s = ""
+    for i in 1 .. indentLevel:
+        s &= "   "
+
+    s &= $ast.kind
+    if ast.kind == nkIdent:
+        s &= ": " & ast.ident.s
+    echo s
+    for child in ast:
+        printTree(child, indentLevel + 1)
+
 proc main() =
     let jsonNode = parseFile("C:/lib/steamworks-150/public/steam/steam_api.json")
-    var ast = newNode(nkStmtList)
+    let ast = newNode(nkStmtList)
+    let typeSection = newNode(nkTypeSection)
+    ast.add(typeSection)
+    for structDef in jsonNode["callback_structs"]:
+        typeSection.add(createStructDef(structDef))
+
     for typedef in jsonNode["typedefs"]:
-        let typeName = typedef["typedef"].str
-        ast.add(newTypedef(typeName, typedef["type"].str))
-        sameTypes.incl(typeName)
+        typeSection.add(createTypedef(typedef))
 
-    echo renderTree(ast)
-
+    createDir("gen")
+    writeFile("gen/steamworks.nim", renderTree(ast))
 
 main()
+
+# let tree = parseString("""
+# type X = object
+#     f1: int
+#     f2: string
+# """, identCache, newPartialConfigRef())
+
+# printTree(tree)
