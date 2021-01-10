@@ -164,27 +164,6 @@ proc newTypedef(aliasName: string, typeName: string): PNode =
     result.add(empty())
     result.add(nimType(typeName))
 
-proc createStructDef(structDef: JsonNode): PNode =
-    let typeName = structDef["struct"].str
-    let recList = newNode(nkRecList)
-    for fieldDef in structDef["fields"]:
-        let defs = newNode(nkIdentDefs)
-        defs.add(ident(fieldDef["fieldname"].str))
-        defs.add(nimType(fieldDef["fieldtype"].str))
-        defs.add(empty())
-        recList.add(defs)
-
-    # TODO: Add methods
-
-    let objectTy = newNode(nkObjectTy)
-    objectTy.add(empty())
-    objectTy.add(empty())
-    objectTy.add(recList)
-    result = newNode(nkTypeDef)
-    result.add(ident(typeName))
-    result.add(empty())
-    result.add(objectTy)
-
 proc createTypeDef(typedef: JsonNode): PNode =
     let typeName = typedef["typedef"].str
     let typeStr = typedef["type"].str
@@ -192,10 +171,15 @@ proc createTypeDef(typedef: JsonNode): PNode =
     typedefMap[typeName] = typeStr
     newTypedef(typeName, typeStr)
 
-iterator createEnumDef(enumDef: JsonNode): PNode =
+iterator createEnumDef(enumDef: JsonNode, namespace: string = ""): PNode =
     # C++ enums don't correspond to Nim enums
     # Instead, use distinct int type with constant values
-    let typeName = enumDef["enumname"].str
+    let unqualifiedName = enumDef["enumname"].str
+    let typeName = if namespace == "":
+        unqualifiedName
+    else:
+        namespace & "_" & unqualifiedName
+
     let values = enumDef["values"]
 
     importedTypes.incl(typeName)
@@ -221,6 +205,35 @@ iterator createEnumDef(enumDef: JsonNode): PNode =
         constSection.add(constDef)
 
     yield constSection
+
+iterator createStructDef(structDef: JsonNode): PNode =
+    let typeName = structDef["struct"].str
+    let recList = newNode(nkRecList)
+    for fieldDef in structDef["fields"]:
+        let defs = newNode(nkIdentDefs)
+        defs.add(ident(fieldDef["fieldname"].str))
+        defs.add(nimType(fieldDef["fieldtype"].str))
+        defs.add(empty())
+        recList.add(defs)
+
+    # TODO: Add methods
+    let enumDefs = structDef{"enums"}
+    if not enumDefs.isNil:
+        for enumDef in enumDefs:
+            for node in createEnumDef(enumDef, typeName):
+                yield node
+
+    let objectTy = newNode(nkObjectTy)
+    objectTy.add(empty())
+    objectTy.add(empty())
+    objectTy.add(recList)
+    let typeDef = newNode(nkTypeDef)
+    typeDef.add(ident(typeName))
+    typeDef.add(empty())
+    typeDef.add(objectTy)
+    let typeSection = newNode(nkTypeSection)
+    typeSection.add(typeDef)
+    yield typeSection
 
 proc printTree(ast: PNode, indentLevel: int = 0) =
     var s = ""
@@ -269,6 +282,13 @@ proc main() =
     let jsonNode = parseFile("C:/lib/steamworks-150/public/steam/steam_api.json")
     let ast = newNode(nkStmtList)
 
+    let colonExpr = newNode(nkExprColonExpr)
+    colonExpr.add(ident("experimental"))
+    colonExpr.add(strLit("codeReordering"))
+    let pragma = newNode(nkPragma)
+    pragma.add(colonExpr)
+    ast.add(pragma)
+
     for enumDef in jsonNode["enums"]:
         for statement in createEnumDef(enumDef):
             ast.add(statement)
@@ -277,10 +297,12 @@ proc main() =
     ast.add(typeSection)
 
     for structDef in jsonNode["structs"]:
-        typeSection.add(createStructDef(structDef))
+        for statement in  createStructDef(structDef):
+            ast.add(statement)
 
     for structDef in jsonNode["callback_structs"]:
-        typeSection.add(createStructDef(structDef))
+        for statement in  createStructDef(structDef):
+            ast.add(statement)
 
     for typedef in jsonNode["typedefs"]:
         typeSection.add(createTypedef(typedef))
