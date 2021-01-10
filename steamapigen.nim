@@ -7,6 +7,8 @@ let typeMap = {
     "bool": "bool",
     "void": "void",
     "int": "cint",
+    "int32": "int32",
+    "uint32": "uint32",
     "unsigned int": "cuint",
     "unsigned char": "cuchar",
     "char": "cchar",
@@ -15,28 +17,37 @@ let typeMap = {
     "unsigned short": "cushort",
     "long long": "clonglong",
     "unsigned long long": "culonglong",
+    "uint16": "uint16",
+    "uint8": "uint8",
+    "uint64": "uint64",
+    "float": "cfloat",
+    "double": "cdouble",
+    "int64_t": "int64",
 }.toTable()
 
 var importedTypes: HashSet[string]
+var unknownTypes: HashSet[string]
+var typedefMap: Table[string, string]
 
-
+proc empty(): Pnode = newNode(nkEmpty)
 
 proc strLit(str: string): Pnode =
     result = newNode(nkStrLit)
     result.strVal = str
 
-proc empty(): Pnode = newNode(nkEmpty)
-
-proc intLit(i: int): Pnode =
+proc intLit(n: int): Pnode =
     result = newNode(nkIntLit)
-    result.intVal = i
+    result.intVal = n
 
 proc getIdent(name: string): PIdent =
-    identCache.getIdent(name)
+    # TODO: Need to use the original name with .cimport
+    identCache.getIdent(name.multiReplace(("__", "_"), ("::", "_NESTED_")))
 
 proc ident(name: string): PNode =
     var lineInfo: TLineInfo
     newIdentNode(getIdent(name), lineInfo)
+
+type UndefinedTypeException = object of CatchAbleError
 
 proc nimTypeName(typeName: string): string =
     if typeName in importedTypes:
@@ -44,8 +55,8 @@ proc nimTypeName(typeName: string): string =
     elif typeName in typeMap:
         typeMap[typeName]
     else:
+        unknownTypes.incl(typeName)
         typeName
-        # raise newException(Exception, "Unknown type: " & typeName)
 
 proc nimType(typeName: string): PNode
 
@@ -64,15 +75,15 @@ proc arrayType(typeStr: string): PNode =
         nil
 
 proc procType(returnTypeStr: string, paramTypeNames: openArray[string]): PNode =
-    let defs = newNode(nkIdentDefs)
-    for typeName in paramTypeNames:
-        defs.add(nimType(typeName))
-
-    defs.add(empty())
-    defs.add(empty())
     let params = newNode(nkFormalParams)
     params.add(nimType(returnTypeStr))
-    params.add(defs)
+    for i, typeName in paramTypeNames:
+        let defs = newNode(nkIdentDefs)
+        defs.add(ident("arg" & $i))
+        defs.add(nimType(typeName))
+        defs.add(empty())
+        params.add(defs)
+
     result = newNode(nkProcTy)
     result.add(params)
     result.add(empty())
@@ -121,11 +132,31 @@ proc nimType(typeName: string): PNode =
 
     ident(nimTypeName(typeName))
 
-proc newConstDef(name: string, typeName: string, valString: string): PNode =
+proc resolveTypedef(typeName: string): string =
+    if typeMap.contains(typeName):
+        typeMap[typeName]
+    elif typedefMap.contains(typeName):
+        resolveTypedef(typedefMap[typeName])
+    else:
+        raise newException(Exception, "Unknown typedef: " & typeName)
+
+proc newConstDef(name: string, typeName: string, valueExpr: Pnode): PNode =
     result = newNode(nkConstDef)
     result.add(ident(name))
-    result.add(nimType(name))
-    result.add(strLit(valString))
+
+    let nimType = nimType(typeName)
+    result.add(nimType)
+
+    let castNode = newNode(nkCast)
+    castNode.add(ident(resolveTypedef(typeName)))
+    castNode.add(valueExpr)
+    result.add(castNode)
+
+proc createConstDef(constDef: JsonNode, valueExpr: PNode): PNode =
+    newConstDef(
+        constDef["constname"].str,
+        constDef["consttype"].str,
+        valueExpr)
 
 proc newTypedef(aliasName: string, typeName: string): PNode =
     result = newNode(nkTypeDef)
@@ -143,6 +174,8 @@ proc createStructDef(structDef: JsonNode): PNode =
         defs.add(empty())
         recList.add(defs)
 
+    # TODO: Add methods
+
     let objectTy = newNode(nkObjectTy)
     objectTy.add(empty())
     objectTy.add(empty())
@@ -154,8 +187,40 @@ proc createStructDef(structDef: JsonNode): PNode =
 
 proc createTypeDef(typedef: JsonNode): PNode =
     let typeName = typedef["typedef"].str
+    let typeStr = typedef["type"].str
     importedTypes.incl(typeName)
-    newTypedef(typeName, typedef["type"].str)
+    typedefMap[typeName] = typeStr
+    newTypedef(typeName, typeStr)
+
+iterator createEnumDef(enumDef: JsonNode): PNode =
+    # C++ enums don't correspond to Nim enums
+    # Instead, use distinct int type with constant values
+    let typeName = enumDef["enumname"].str
+    let values = enumDef["values"]
+
+    importedTypes.incl(typeName)
+    let typeSection = newNode(nkTypeSection)
+    let typeDef = newNode(nkTypeDef)
+    typeSection.add(typeDef)
+    typeDef.add(ident(typeName))
+    typeDef.add(empty())
+    let distinctTy = newNode(nkDistinctTy)
+    distinctTy.add(ident("cint"))
+    typeDef.add(distinctTy)
+    yield typeSection
+
+    let constSection = newNode(nkConstSection)
+    for val in values:
+        let constDef = newNode(nkConstDef)
+        constDef.add(ident(val["name"].str))
+        constDef.add(ident(typeName))
+        let call = newNode(nkCall)
+        call.add(ident(typeName))
+        call.add(intLit(val["value"].str.parseInt()))
+        constDef.add(call)
+        constSection.add(constDef)
+
+    yield constSection
 
 proc printTree(ast: PNode, indentLevel: int = 0) =
     var s = ""
@@ -169,26 +234,73 @@ proc printTree(ast: PNode, indentLevel: int = 0) =
     for child in ast:
         printTree(child, indentLevel + 1)
 
+proc parseNim(s: string): PNode =
+    parseString(s, identCache, newPartialConfigRef())
+
+proc translateConstExpressions(constDefs: JsonNode): seq[PNode] =
+    createDir("tmp")
+    let cPath = "tmp/consts.c"
+    removeFile(cPath)
+    var file: File
+    if not open(file, cPath, fmAppend):
+        raise newException(IOError, "Could not open file " & cPath)
+
+    for constDef in constDefs:
+        var expressionStr = constDef["constval"].str
+
+        # Kludge to work around c2nim being unable to parse `( SteamItemInstanceID_t ) ~ 0`
+        expressionStr = expressionStr.replace("~", "1 * ~")
+        file.write(expressionStr & ";\n")
+
+    file.close()
+    if execShellCmd("c2nim " & cPath) != 0:
+        raise newException(Exception, "c2nim failed")
+    let nimPath = cPath.changeFileExt("nim")
+    if not open(file, nimPath):
+        raise newException(IOError, "Could not open file " & nimPath)
+
+    defer: file.close()
+    parseNim(file.readAll()).sons
+
+proc printAst(s: string) =
+    printTree(parseNim(s))
+
 proc main() =
     let jsonNode = parseFile("C:/lib/steamworks-150/public/steam/steam_api.json")
     let ast = newNode(nkStmtList)
+
+    for enumDef in jsonNode["enums"]:
+        for statement in createEnumDef(enumDef):
+            ast.add(statement)
+
     let typeSection = newNode(nkTypeSection)
     ast.add(typeSection)
+
+    for structDef in jsonNode["structs"]:
+        typeSection.add(createStructDef(structDef))
+
     for structDef in jsonNode["callback_structs"]:
         typeSection.add(createStructDef(structDef))
 
     for typedef in jsonNode["typedefs"]:
         typeSection.add(createTypedef(typedef))
 
+    let constSection = newNode(nkConstSection)
+    ast.add(constSection)
+
+    echo "Translating"
+    let translations = translateConstExpressions(jsonNode["consts"])
+    echo "Translated"
+    for i, constDef in jsonNode["consts"].elems:
+        constSection.add(createConstDef(constDef, translations[i]))
+
+    for typeName in unknownTypes:
+        if not importedTypes.contains(typeName):
+            echo "Missing definition for " & typeName
+
+    echo "Writing"
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
 
-main()
-
-# let tree = parseString("""
-# type X = object
-#     f1: int
-#     f2: string
-# """, identCache, newPartialConfigRef())
-
-# printTree(tree)
+when isMainModule:
+    main()
