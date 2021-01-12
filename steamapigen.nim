@@ -1,5 +1,5 @@
 import compiler/[ast, idents, renderer, lineinfos, parser, options]
-import json, tables, sets, strutils, os
+import json, tables, sets, strutils, os, sugar
 
 
 let identCache = newIdentCache()
@@ -24,6 +24,8 @@ let typeMap = {
     "double": "cdouble",
     "int32_t": "int32",
     "int64_t": "int64",
+    "size_t": "csize_t",
+    "intptr_t": "pointer",
 }.toTable()
 
 var importedTypes: HashSet[string]
@@ -40,17 +42,19 @@ proc intLit(n: int): Pnode =
     result = newNode(nkIntLit)
     result.intVal = n
 
+proc cleanIdentifier(id: string): string =
+    id.multiReplace(("__", "_"), ("::", "_"))
+
 proc getIdent(name: string): PIdent =
     # TODO: Need to use the original name with .cimport
-    identCache.getIdent(name.multiReplace(("__", "_"), ("::", "_")))
+    identCache.getIdent(cleanIdentifier(name))
 
 proc ident(name: string): PNode =
     var lineInfo: TLineInfo
     newIdentNode(getIdent(name), lineInfo)
 
-type UndefinedTypeException = object of CatchAbleError
-
 proc nimTypeName(typeName: string): string =
+    let typeName = cleanIdentifier(typeName)
     if typeName in importedTypes:
         typeName
     elif typeName in typeMap:
@@ -60,6 +64,11 @@ proc nimTypeName(typeName: string): string =
         typeName
 
 proc nimType(typeName: string): PNode
+
+proc exportedIdent(name: string): PNode =
+    result = newNode(nkPostfix)
+    result.add(ident("*"))
+    result.add(ident(name))
 
 proc arrayType(typeName: string, length: int): PNode =
     result = newNode(nkBracketExpr)
@@ -76,6 +85,10 @@ proc arrayType(typeStr: string): PNode =
         nil
 
 proc identDefs(name: string, typeDesc: PNode, defaultValue: PNode = empty()): PNode =
+    var name = name
+    if name in ["addr", "type"]:
+        name &= '1'
+
     result = newNode(nkIdentDefs)
     result.add(ident(name))
     result.add(typeDesc)
@@ -133,6 +146,7 @@ proc refType(typeStr: string): PNode =
 proc nimType(typeName: string): PNode =
     var typeName = typeName.strip()
     typeName.removePrefix("const")
+    typeName.removeSuffix("const")
     typeName = typeName.strip()
     let asPointer = pointerType(typeName)
     if asPointer != nil:
@@ -162,7 +176,7 @@ proc resolveTypedef(typeName: string): string =
 
 proc newConstDef(name: string, typeName: string, valueExpr: Pnode): PNode =
     result = newNode(nkConstDef)
-    result.add(ident(name))
+    result.add(exportedIdent(name))
 
     let nimType = nimType(typeName)
     result.add(nimType)
@@ -178,17 +192,21 @@ proc createConstDef(constDef: JsonNode, valueExpr: PNode): PNode =
         constDef["consttype"].str,
         valueExpr)
 
-proc newTypedef(aliasName: string, typeName: string): PNode =
+proc newTypeDef(name: string, typeDesc: PNode): PNode =
+    importedTypes.incl(name)
     result = newNode(nkTypeDef)
-    result.add(ident(aliasName))
-    result.add(empty())
-    result.add(nimType(typeName))
+    result.add(exportedIdent(name))
+    result.add(empty()) # Generic parameters
+    result.add(typeDesc)
+
+proc newTypedef(aliasName: string, typeStr: string): PNode =
+    importedTypes.incl(aliasName)
+    typedefMap[aliasName] = typeStr
+    newTypeDef(aliasName, nimType(typeStr))
 
 proc createTypeDef(typedef: JsonNode): PNode =
     let typeName = typedef["typedef"].str
     let typeStr = typedef["type"].str
-    importedTypes.incl(typeName)
-    typedefMap[typeName] = typeStr
     newTypedef(typeName, typeStr)
 
 proc newDistinctTypeDef(typeName: string, typeDesc: PNode): PNode =
@@ -218,7 +236,7 @@ iterator createEnumDef(enumDef: JsonNode, namespace: string = ""): PNode =
     let constSection = newNode(nkConstSection)
     for val in values:
         let constDef = newNode(nkConstDef)
-        constDef.add(ident(val["name"].str))
+        constDef.add(exportedIdent(val["name"].str))
         constDef.add(ident(typeName))
         let call = newNode(nkCall)
         call.add(ident(typeName))
@@ -228,29 +246,72 @@ iterator createEnumDef(enumDef: JsonNode, namespace: string = ""): PNode =
 
     yield constSection
 
-proc createMethodDef(methodDef: JsonNode, typeName: string): PNode =
+proc newPragma(pragmas: varargs[PNode]): PNode =
+    result = newNode(nkPragma)
+    for pragma in pragmas:
+        result.add(pragma)
+
+proc newExprColonExpr(a: PNode, b: PNode): Pnode =
+    result = newNode(nkExprColonExpr)
+    result.add(a)
+    result.add(b)
+
+proc newProcDef(name: string, returnTypeDesc: PNode, params: varargs[PNode]): PNode =
+    let formalParams = newNode(nkFormalParams)
+    formalParams.add(returnTypeDesc)
+    for param in params:
+        formalParams.add(param)
+
+    let pragmas = newPragma(
+        ident("importc"),
+        ident("cdecl"),
+        newExprColonExpr(
+            ident("dynlib"),
+            strLit("win64/steamapi64.dll")))
+
     result = newNode(nkProcDef)
-    result.add(ident(methodDef["methodname_flat"].str))
+    result.add(exportedIdent(name))
     result.add(empty()) # Only used for macros
     result.add(empty()) # Generic parameters
-
-    let formalParams = newNode(nkFormalParams)
-    formalParams.add(nimType(methodDef["returntype"].str))
-    formalParams.add(identDefs("this", ptrTy(nimType(typeName))))
-
-    for paramDef in methodDef["params"]:
-        formalParams.add(
-            identDefs(
-                paramDef["paramname"].str,
-                nimType(paramDef["paramtype"].str)))
-
     result.add(formalParams)
-    result.add(empty()) # Pragmas
+    result.add(pragmas)
     result.add(empty()) # Reserved
     result.add(empty()) # Statements
 
-iterator createStructDef(structDef: JsonNode): PNode =
-    let typeName = structDef["struct"].str
+proc createMethodDef(methodDef: JsonNode, typeName: string): PNode =
+    let thisParam = identDefs("this", ptrTy(nimType(typeName)))
+    let paramDefs = collect(newSeq):
+        for paramDef in methodDef["params"]:
+            identDefs(
+                paramDef["paramname"].str,
+                nimType(paramDef["paramtype"].str))
+
+    newProcDef(
+        methodDef["methodname_flat"].str,
+        nimType(methodDef["returntype"].str),
+        thisParam & paramDefs)
+
+proc newTypeSection(typeDefs: varargs[PNode]): PNode =
+    result = newNode(nkTypeSection)
+    for typeDef in typeDefs:
+        result.add(typeDef)
+
+# Each field is typically an IdentDefs
+proc newObjectTy(fields: varargs[PNode]): PNode =
+    result = newNode(nkObjectTy)
+    result.add(empty()) # Pragmas
+    result.add(empty()) # Base object
+
+    let recList = newNode(nkRecList)
+    for field in fields:
+        recList.add(field)
+
+    result.add(recList)
+
+proc newObjectDef(name: string, fields: varargs[PNode]): PNode =
+    newTypeDef(name, newObjectTy(fields))
+
+proc createStructDef(typeName: string, structDef: JsonNode): seq[PNode] =
     let recList = newNode(nkRecList)
     for fieldDef in structDef["fields"]:
         recList.add(
@@ -262,24 +323,32 @@ iterator createStructDef(structDef: JsonNode): PNode =
     if not enumDefs.isNil:
         for enumDef in enumDefs:
             for node in createEnumDef(enumDef, typeName):
-                yield node
+                result.add(node)
 
     let objectTy = newNode(nkObjectTy)
     objectTy.add(empty())
     objectTy.add(empty())
     objectTy.add(recList)
-    let typeDef = newNode(nkTypeDef)
-    typeDef.add(ident(typeName))
-    typeDef.add(empty())
-    typeDef.add(objectTy)
-    let typeSection = newNode(nkTypeSection)
-    typeSection.add(typeDef)
-    yield typeSection
+    result.add(newTypeSection(newTypeDef(typeName, objectTy)))
 
     let methodDefs = structDef{"methods"}
     if not methodDefs.isNil:
         for methodDef in methodDefs:
-            yield createMethodDef(methodDef, typeName)
+            result.add(createMethodDef(methodDef, typeName))
+
+proc createStructDef(structDef: JsonNode): seq[Pnode] =
+    createStructDef(structDef["struct"].str, structDef)
+
+proc createInterfaceDef(interfaceDef: JsonNode): seq[PNode] =
+    let typeName = interfaceDef["classname"].str
+    result = createStructDef(typeName, interfaceDef)
+    let accessors = interfaceDef{"accessors"}
+    if not accessors.isNil:
+        for accessor in accessors:
+            result.add(
+                newProcDef(
+                    accessor["name_flat"].str,
+                    nimType(typeName)))
 
 proc printTree(ast: PNode, indentLevel: int = 0) =
     var s = ""
@@ -323,6 +392,7 @@ proc translateConstExpressions(constDefs: JsonNode): seq[PNode] =
 
 proc printAst(s: string) =
     printTree(parseNim(s))
+    echo renderTree(parseNim(s))
 
 proc main() =
     let jsonNode = parseFile("C:/lib/steamworks-150/public/steam/steam_api.json")
@@ -335,7 +405,9 @@ proc main() =
     pragma.add(colonExpr)
     ast.add(pragma)
     ast.add(newDistinctTypeDef("CSteamID", ident("uint64")))
+    importedTypes.incl("CSteamID")
     ast.add(newDIstinctTypeDef("CGameID", ident("uint64")))
+    importedTypes.incl("CGameID")
 
     for enumDef in jsonNode["enums"]:
         for statement in createEnumDef(enumDef):
@@ -343,6 +415,9 @@ proc main() =
 
     let typeSection = newNode(nkTypeSection)
     ast.add(typeSection)
+
+    for typedef in jsonNode["typedefs"]:
+        typeSection.add(createTypedef(typedef))
 
     for structDef in jsonNode["structs"]:
         for statement in createStructDef(structDef):
@@ -352,8 +427,9 @@ proc main() =
         for statement in createStructDef(structDef):
             ast.add(statement)
 
-    for typedef in jsonNode["typedefs"]:
-        typeSection.add(createTypedef(typedef))
+    for interfaceDef in jsonNode["interfaces"]:
+        for statement in createInterfaceDef(interfaceDef):
+            ast.add(statement)
 
     let constSection = newNode(nkConstSection)
     ast.add(constSection)
@@ -365,6 +441,7 @@ proc main() =
     for typeName in unknownTypes:
         if not importedTypes.contains(typeName):
             echo "Missing definition for " & typeName
+            typeSection.add(newObjectDef(typeName))
 
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
