@@ -130,6 +130,9 @@ proc pointerType(typeStr: string): PNode =
     if innerTypeStr == "void":
         return ident("pointer")
 
+    if innerTypeStr == "char":
+        return ident("cstring")
+
     result = ptrTy(nimType(innerTypeStr))
 
 proc varTy(typeDesc: PNode): Pnode =
@@ -267,7 +270,7 @@ proc newProcDef(name: string, returnTypeDesc: PNode, params: varargs[PNode]): PN
         ident("cdecl"),
         newExprColonExpr(
             ident("dynlib"),
-            strLit("win64/steamapi64.dll")))
+            strLit("win64/steam_api64.dll")))
 
     result = newNode(nkProcDef)
     result.add(exportedIdent(name))
@@ -442,6 +445,22 @@ proc main() =
         if not importedTypes.contains(typeName):
             echo "Missing definition for " & typeName
             typeSection.add(newObjectDef(typeName))
+
+    ast.add(newProcDef("SteamAPI_Init", nimType("bool")))
+    ast.add(newProcDef("SteamAPI_ReleaseCurrentThreadMemory", nimType("void")))
+    ast.add(newProcDef("SteamAPI_RestartAppIfNecessary", nimType("bool"), identDefs("unOwnAppID", nimType("uint32"))))
+    ast.add(newProcDef("SteamAPI_RunCallbacks", nimType("void")))
+    ast.add(newProcDef("SteamAPI_SetMiniDumpComment", nimType("void"), identDefs("pchMsg", nimType("const char *"))))
+    ast.add(newProcDef("SteamAPI_Shutdown", nimType("void")))
+    ast.add(
+        newProcDef(
+            "SteamAPI_WriteMiniDump",
+            nimType("void"),
+            identDefs("uStructuredExceptionCode", nimType("uint32")),
+            identDefs("pvExceptionInfo", nimType("void *")),
+            identDefs("uBuildID", nimType("uint32"))))
+
+    ast.add(newProcDef("SteamClient", nimType("ISteamClient *")))
 
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
