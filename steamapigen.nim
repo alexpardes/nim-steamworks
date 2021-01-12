@@ -22,6 +22,7 @@ let typeMap = {
     "uint64": "uint64",
     "float": "cfloat",
     "double": "cdouble",
+    "int32_t": "int32",
     "int64_t": "int64",
 }.toTable()
 
@@ -41,7 +42,7 @@ proc intLit(n: int): Pnode =
 
 proc getIdent(name: string): PIdent =
     # TODO: Need to use the original name with .cimport
-    identCache.getIdent(name.multiReplace(("__", "_"), ("::", "_NESTED_")))
+    identCache.getIdent(name.multiReplace(("__", "_"), ("::", "_")))
 
 proc ident(name: string): PNode =
     var lineInfo: TLineInfo
@@ -74,15 +75,17 @@ proc arrayType(typeStr: string): PNode =
     else:
         nil
 
+proc identDefs(name: string, typeDesc: PNode, defaultValue: PNode = empty()): PNode =
+    result = newNode(nkIdentDefs)
+    result.add(ident(name))
+    result.add(typeDesc)
+    result.add(defaultValue)
+
 proc procType(returnTypeStr: string, paramTypeNames: openArray[string]): PNode =
     let params = newNode(nkFormalParams)
     params.add(nimType(returnTypeStr))
     for i, typeName in paramTypeNames:
-        let defs = newNode(nkIdentDefs)
-        defs.add(ident("arg" & $i))
-        defs.add(nimType(typeName))
-        defs.add(empty())
-        params.add(defs)
+        params.add(identDefs("arg" & $i, nimType(typeName)))
 
     result = newNode(nkProcTy)
     result.add(params)
@@ -102,6 +105,10 @@ proc procType(typeStr: string): PNode =
     else:
         nil
 
+proc ptrTy(typeDesc: PNode): PNode =
+    result = newNode(nkPtrTy)
+    result.add(typeDesc)
+
 proc pointerType(typeStr: string): PNode =
     if typeStr[^1] != '*':
         return nil
@@ -110,9 +117,18 @@ proc pointerType(typeStr: string): PNode =
     if innerTypeStr == "void":
         return ident("pointer")
 
-    result = newNode(nkPtrTy)
-    result.add(nimType(innerTypeStr))
+    result = ptrTy(nimType(innerTypeStr))
 
+proc varTy(typeDesc: PNode): Pnode =
+    result = newNode(nkVarTy)
+    result.add(typeDesc)
+
+proc refType(typeStr: string): PNode =
+    if typeStr[^1] == '&':
+        let innerTypeStr = typeStr[0 ..< ^1].strip()
+        varTy(nimType(innerTypeStr))
+    else:
+        nil
 
 proc nimType(typeName: string): PNode =
     var typeName = typeName.strip()
@@ -121,6 +137,10 @@ proc nimType(typeName: string): PNode =
     let asPointer = pointerType(typeName)
     if asPointer != nil:
         return asPointer
+
+    let asRef = refType(typeName)
+    if asRef != nil:
+        return asRef
 
     let asArray = arrayType(typeName)
     if asArray != nil:
@@ -171,9 +191,19 @@ proc createTypeDef(typedef: JsonNode): PNode =
     typedefMap[typeName] = typeStr
     newTypedef(typeName, typeStr)
 
+proc newDistinctTypeDef(typeName: string, typeDesc: PNode): PNode =
+    result = newNode(nkTypeSection)
+    let typeDef = newNode(nkTypeDef)
+    result.add(typeDef)
+    typeDef.add(ident(typeName))
+    typeDef.add(empty())
+    let distinctTy = newNode(nkDistinctTy)
+    distinctTy.add(typeDesc)
+    typeDef.add(distinctTy)
+
 iterator createEnumDef(enumDef: JsonNode, namespace: string = ""): PNode =
-    # C++ enums don't correspond to Nim enums
-    # Instead, use distinct int type with constant values
+    # C++ enums don't follow all restrictions of Nim enums
+    # We represent a C++ enum as a distinct int type and a block of constants of that type
     let unqualifiedName = enumDef["enumname"].str
     let typeName = if namespace == "":
         unqualifiedName
@@ -183,15 +213,7 @@ iterator createEnumDef(enumDef: JsonNode, namespace: string = ""): PNode =
     let values = enumDef["values"]
 
     importedTypes.incl(typeName)
-    let typeSection = newNode(nkTypeSection)
-    let typeDef = newNode(nkTypeDef)
-    typeSection.add(typeDef)
-    typeDef.add(ident(typeName))
-    typeDef.add(empty())
-    let distinctTy = newNode(nkDistinctTy)
-    distinctTy.add(ident("cint"))
-    typeDef.add(distinctTy)
-    yield typeSection
+    yield newDistinctTypeDef(typeName, ident("cint"))
 
     let constSection = newNode(nkConstSection)
     for val in values:
@@ -206,17 +228,36 @@ iterator createEnumDef(enumDef: JsonNode, namespace: string = ""): PNode =
 
     yield constSection
 
+proc createMethodDef(methodDef: JsonNode, typeName: string): PNode =
+    result = newNode(nkProcDef)
+    result.add(ident(methodDef["methodname_flat"].str))
+    result.add(empty()) # Only used for macros
+    result.add(empty()) # Generic parameters
+
+    let formalParams = newNode(nkFormalParams)
+    formalParams.add(nimType(methodDef["returntype"].str))
+    formalParams.add(identDefs("this", ptrTy(nimType(typeName))))
+
+    for paramDef in methodDef["params"]:
+        formalParams.add(
+            identDefs(
+                paramDef["paramname"].str,
+                nimType(paramDef["paramtype"].str)))
+
+    result.add(formalParams)
+    result.add(empty()) # Pragmas
+    result.add(empty()) # Reserved
+    result.add(empty()) # Statements
+
 iterator createStructDef(structDef: JsonNode): PNode =
     let typeName = structDef["struct"].str
     let recList = newNode(nkRecList)
     for fieldDef in structDef["fields"]:
-        let defs = newNode(nkIdentDefs)
-        defs.add(ident(fieldDef["fieldname"].str))
-        defs.add(nimType(fieldDef["fieldtype"].str))
-        defs.add(empty())
-        recList.add(defs)
+        recList.add(
+            identDefs(
+                fieldDef["fieldname"].str,
+                nimType(fieldDef["fieldtype"].str)))
 
-    # TODO: Add methods
     let enumDefs = structDef{"enums"}
     if not enumDefs.isNil:
         for enumDef in enumDefs:
@@ -234,6 +275,11 @@ iterator createStructDef(structDef: JsonNode): PNode =
     let typeSection = newNode(nkTypeSection)
     typeSection.add(typeDef)
     yield typeSection
+
+    let methodDefs = structDef{"methods"}
+    if not methodDefs.isNil:
+        for methodDef in methodDefs:
+            yield createMethodDef(methodDef, typeName)
 
 proc printTree(ast: PNode, indentLevel: int = 0) =
     var s = ""
@@ -288,6 +334,8 @@ proc main() =
     let pragma = newNode(nkPragma)
     pragma.add(colonExpr)
     ast.add(pragma)
+    ast.add(newDistinctTypeDef("CSteamID", ident("uint64")))
+    ast.add(newDIstinctTypeDef("CGameID", ident("uint64")))
 
     for enumDef in jsonNode["enums"]:
         for statement in createEnumDef(enumDef):
@@ -297,11 +345,11 @@ proc main() =
     ast.add(typeSection)
 
     for structDef in jsonNode["structs"]:
-        for statement in  createStructDef(structDef):
+        for statement in createStructDef(structDef):
             ast.add(statement)
 
     for structDef in jsonNode["callback_structs"]:
-        for statement in  createStructDef(structDef):
+        for statement in createStructDef(structDef):
             ast.add(statement)
 
     for typedef in jsonNode["typedefs"]:
@@ -310,9 +358,7 @@ proc main() =
     let constSection = newNode(nkConstSection)
     ast.add(constSection)
 
-    echo "Translating"
     let translations = translateConstExpressions(jsonNode["consts"])
-    echo "Translated"
     for i, constDef in jsonNode["consts"].elems:
         constSection.add(createConstDef(constDef, translations[i]))
 
@@ -320,7 +366,6 @@ proc main() =
         if not importedTypes.contains(typeName):
             echo "Missing definition for " & typeName
 
-    echo "Writing"
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
 
