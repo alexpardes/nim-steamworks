@@ -31,6 +31,7 @@ let typeMap = {
 var importedTypes: HashSet[string]
 var unknownTypes: HashSet[string]
 var typedefMap: Table[string, string]
+var interfaceVersionStrings: Table[string, string]
 
 proc empty(): Pnode = newNode(nkEmpty)
 
@@ -177,17 +178,20 @@ proc resolveTypedef(typeName: string): string =
     else:
         raise newException(Exception, "Unknown typedef: " & typeName)
 
-proc newConstDef(name: string, typeName: string, valueExpr: Pnode): PNode =
+proc newConstDef(name: string, typeDesc: PNode, value: PNode): PNode =
     result = newNode(nkConstDef)
     result.add(exportedIdent(name))
+    result.add(typeDesc)
+    result.add(value)
 
-    let nimType = nimType(typeName)
-    result.add(nimType)
-
+proc newConstDef(name: string, typeName: string, valueExpr: PNode): PNode =
     let castNode = newNode(nkCast)
     castNode.add(ident(resolveTypedef(typeName)))
     castNode.add(valueExpr)
-    result.add(castNode)
+    newConstDef(
+        name,
+        nimType(typeName),
+        castNode)
 
 proc createConstDef(constDef: JsonNode, valueExpr: PNode): PNode =
     newConstDef(
@@ -221,6 +225,17 @@ proc newDistinctTypeDef(typeName: string, typeDesc: PNode): PNode =
     let distinctTy = newNode(nkDistinctTy)
     distinctTy.add(typeDesc)
     typeDef.add(distinctTy)
+
+proc newConstSection(constDefs: varargs[PNode]): PNode =
+    result = newNode(nkConstSection)
+    for constDef in constDefs:
+        result.add(constDef)
+
+proc newCall(procName: string, args: varargs[PNode]): PNode =
+    result = newNode(nkCall)
+    result.add(ident(procName))
+    for arg in args:
+        result.add(arg)
 
 iterator createEnumDef(enumDef: JsonNode, namespace: string = ""): PNode =
     # C++ enums don't follow all restrictions of Nim enums
@@ -259,18 +274,18 @@ proc newExprColonExpr(a: PNode, b: PNode): Pnode =
     result.add(a)
     result.add(b)
 
-proc newProcDef(name: string, returnTypeDesc: PNode, params: varargs[PNode]): PNode =
+proc newProcDef(
+    name: string,
+    returnType: PNode,
+    params: openArray[PNode],
+    pragmas: PNode = empty(),
+    statements: PNode = empty()
+): PNode =
+
     let formalParams = newNode(nkFormalParams)
-    formalParams.add(returnTypeDesc)
+    formalParams.add(returnType)
     for param in params:
         formalParams.add(param)
-
-    let pragmas = newPragma(
-        ident("importc"),
-        ident("cdecl"),
-        newExprColonExpr(
-            ident("dynlib"),
-            strLit("win64/steam_api64.dll")))
 
     result = newNode(nkProcDef)
     result.add(exportedIdent(name))
@@ -279,7 +294,17 @@ proc newProcDef(name: string, returnTypeDesc: PNode, params: varargs[PNode]): PN
     result.add(formalParams)
     result.add(pragmas)
     result.add(empty()) # Reserved
-    result.add(empty()) # Statements
+    result.add(statements)
+
+proc newImportedProcDef(name: string, returnTypeDesc: PNode, params: varargs[PNode]): PNode =
+    let pragmas = newPragma(
+        ident("importc"),
+        ident("cdecl"),
+        newExprColonExpr(
+            ident("dynlib"),
+            ident("steamworksLib")))
+
+    newProcDef(name, returnTypeDesc, params, pragmas)
 
 proc createMethodDef(methodDef: JsonNode, typeName: string): PNode =
     let thisParam = identDefs("this", ptrTy(nimType(typeName)))
@@ -289,10 +314,56 @@ proc createMethodDef(methodDef: JsonNode, typeName: string): PNode =
                 paramDef["paramname"].str,
                 nimType(paramDef["paramtype"].str))
 
-    newProcDef(
+    newImportedProcDef(
         methodDef["methodname_flat"].str,
         nimType(methodDef["returntype"].str),
         thisParam & paramDefs)
+
+# proc createInterfaceMethodDef(methodDef: JsonNode, typeName: string, versionString: string): seq[PNode] =
+#     let paramDefs = methodDef["params"].getElems
+#     let thisParam = identDefs("this", ptrTy(nimType(typeName)))
+#     var versionParam: PNode
+#     var params = collect(newSeq):
+#         for i, paramDef in paramDefs:
+#             let paramName = paramDef["paramname"].str
+#             let identDefs = identDefs(
+#                 paramName,
+#                 nimType(paramDef["paramtype"].str))
+
+#             if paramName == "pchVersion":
+#                 versionParam = identDefs
+#                 assert i == high(paramDefs)
+#                 break
+
+#             identDefs
+
+#     let methodName = methodDef["methodname_flat"].str
+#     let returnType = nimType(methodDef["returntype"].str)
+#     params = thisParam & params
+#     if not versionParam.isNil:
+#         assert versionString != "", typeName
+#         params &= versionParam
+
+#     let procDef = newImportedProcDef(
+#         methodName,
+#         returnType,
+#         params)
+
+#     result.add(procDef)
+
+#     if not versionParam.isNil:
+#         let body = newNode(nkStmtList)
+#         let args = collect(newSeq):
+#             for paramDef in paramDefs:
+#                 let paramName = paramDef["paramname"].str
+#                 if paramName == "pchVersion":
+#                     break
+
+#                 ident(paramName)
+
+#         body.add(newCall(methodName, args))
+#         let wrapperDef = newProcDef(methodName, returnType, params, empty(), body)
+#         result.add(wrapperDef)
 
 proc newTypeSection(typeDefs: varargs[PNode]): PNode =
     result = newNode(nkTypeSection)
@@ -344,14 +415,27 @@ proc createStructDef(structDef: JsonNode): seq[Pnode] =
 
 proc createInterfaceDef(interfaceDef: JsonNode): seq[PNode] =
     let typeName = interfaceDef["classname"].str
-    result = createStructDef(typeName, interfaceDef)
+    result.add(newTypeSection(newObjectDef(typeName)))
     let accessors = interfaceDef{"accessors"}
     if not accessors.isNil:
         for accessor in accessors:
             result.add(
-                newProcDef(
+                newImportedProcDef(
                     accessor["name_flat"].str,
                     nimType(typeName)))
+
+    let enumDefs = interfaceDef{"enums"}
+    if not enumDefs.isNil:
+        for enumDef in enumDefs:
+            for node in createEnumDef(enumDef, typeName):
+                result.add(node)
+
+    let versionNode = interfaceDef{"version_string"}
+    if not versionNode.isNil:
+        interfaceVersionStrings[typeName] = versionNode.str
+
+    for methodDef in interfaceDef["methods"]:
+        result.add(createMethodDef(methodDef, typeName))
 
 proc printTree(ast: PNode, indentLevel: int = 0) =
     var s = ""
@@ -397,6 +481,11 @@ proc printAst(s: string) =
     printTree(parseNim(s))
     echo renderTree(parseNim(s))
 
+proc findISteamClientDef(interfaceDefs: JsonNode): JsonNode =
+    for def in interfaceDefs:
+        if def["classname"].str == "ISteamClient":
+            return def
+
 proc main() =
     let jsonNode = parseFile("C:/lib/steamworks-150/public/steam/steam_api.json")
     let ast = newNode(nkStmtList)
@@ -407,6 +496,14 @@ proc main() =
     let pragma = newNode(nkPragma)
     pragma.add(colonExpr)
     ast.add(pragma)
+
+    ast.add(
+        newConstSection(
+            newConstDef(
+                "steamworksLib",
+                empty(),
+                strLit("win64/steam_api64.dll"))))
+
     ast.add(newDistinctTypeDef("CSteamID", ident("uint64")))
     importedTypes.incl("CSteamID")
     ast.add(newDIstinctTypeDef("CGameID", ident("uint64")))
@@ -446,21 +543,45 @@ proc main() =
             echo "Missing definition for " & typeName
             typeSection.add(newObjectDef(typeName))
 
-    ast.add(newProcDef("SteamAPI_Init", nimType("bool")))
-    ast.add(newProcDef("SteamAPI_ReleaseCurrentThreadMemory", nimType("void")))
-    ast.add(newProcDef("SteamAPI_RestartAppIfNecessary", nimType("bool"), identDefs("unOwnAppID", nimType("uint32"))))
-    ast.add(newProcDef("SteamAPI_RunCallbacks", nimType("void")))
-    ast.add(newProcDef("SteamAPI_SetMiniDumpComment", nimType("void"), identDefs("pchMsg", nimType("const char *"))))
-    ast.add(newProcDef("SteamAPI_Shutdown", nimType("void")))
+    ast.add(newImportedProcDef("SteamAPI_Init", nimType("bool")))
+    ast.add(newImportedProcDef("SteamAPI_ReleaseCurrentThreadMemory", nimType("void")))
+    ast.add(newImportedProcDef("SteamAPI_RestartAppIfNecessary", nimType("bool"), identDefs("unOwnAppID", nimType("uint32"))))
+    ast.add(newImportedProcDef("SteamAPI_RunCallbacks", nimType("void")))
+    ast.add(newImportedProcDef("SteamAPI_SetMiniDumpComment", nimType("void"), identDefs("pchMsg", nimType("const char *"))))
+    ast.add(newImportedProcDef("SteamAPI_Shutdown", nimType("void")))
     ast.add(
-        newProcDef(
+        newImportedProcDef(
             "SteamAPI_WriteMiniDump",
             nimType("void"),
             identDefs("uStructuredExceptionCode", nimType("uint32")),
             identDefs("pvExceptionInfo", nimType("void *")),
             identDefs("uBuildID", nimType("uint32"))))
 
-    ast.add(newProcDef("SteamClient", nimType("ISteamClient *")))
+    ast.add(newImportedProcDef("SteamClient", nimType("ISteamClient *")))
+    let isteamClientDef = findISteamClientDef(jsonNode["interfaces"])
+    for interfaceName, versionString in interfaceVersionStrings:
+        let procName = "Get" & interfacename
+        let flatName = "SteamAPI_ISteamClient_" & procName
+        let params = [
+            identDefs("this", ptrTy(ident("ISteamClient"))),
+            identDefs("hSteamUser", nimType("HSteamUser")),
+            identDefs("hSteamPipe", nimType("HSteamPipe"))]
+
+        let body = newNode(nkStmtList)
+        body.add(
+            newCall(
+                flatName,
+                ident("this"),
+                ident("hSteamUser"),
+                ident("hSteamPipe"),
+                strLit(versionString)))
+
+        ast.add(
+            newProcDef(
+                procName,
+                ptrTy(ident(interfaceName)),
+                params,
+                statements = body))
 
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
