@@ -1,6 +1,12 @@
 import compiler/[ast, idents, renderer, lineinfos, parser, options]
 import json, tables, sets, strutils, os, sugar
 
+let jsonPath = "../steamworks-sdk/public/steam/steam_api.json"  
+
+when system.hostOS == "windows":
+    let libPath = "win64/steam_api64.dll"
+elif system.hostOS == "linux":
+    let libPath = "linux64/libsteam_api.so"
 
 let identCache = newIdentCache()
 let typeMap = {
@@ -487,7 +493,7 @@ proc findISteamClientDef(interfaceDefs: JsonNode): JsonNode =
             return def
 
 proc main() =
-    let jsonNode = parseFile("C:/lib/steamworks-150/public/steam/steam_api.json")
+    let jsonNode = parseFile(jsonPath)
     let ast = newNode(nkStmtList)
 
     let colonExpr = newNode(nkExprColonExpr)
@@ -502,7 +508,7 @@ proc main() =
             newConstDef(
                 "steamworksLib",
                 empty(),
-                strLit("win64/steam_api64.dll"))))
+                strLit(libPath))))
 
     ast.add(newDistinctTypeDef("CSteamID", ident("uint64")))
     importedTypes.incl("CSteamID")

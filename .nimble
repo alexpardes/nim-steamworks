@@ -1,0 +1,1 @@
+requires "c2nim"
