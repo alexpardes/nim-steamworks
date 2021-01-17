@@ -443,6 +443,46 @@ proc createInterfaceDef(interfaceDef: JsonNode): seq[PNode] =
     for methodDef in interfaceDef["methods"]:
         result.add(createMethodDef(methodDef, typeName))
 
+proc createVersionlessMethodWrapper(methodDef: JsonNode): PNode =
+    let procName = methodDef["methodname_flat"].str
+    if procName == "SteamAPI_ISteamClient_GetISteamGenericInterface":
+        return nil
+
+    let returnTypestr = methodDef["returntype"].str
+    let returnType = nimType(returnTypestr)
+    let thisParam = identDefs("this", ptrTy(nimType("ISteamClient")))
+    let paramDefs = methodDef["params"].getElems()
+    if paramDefs.len == 0 or paramDefs[^1]["paramname"].str != "pchVersion":
+        return nil
+
+    var args = @[ident("this")]
+    var params = @[thisParam]
+    for paramDef in paramDefs[0 ..< ^1]:
+        let paramName = paramDef["paramname"].str
+        args.add(ident(paramName))
+        params.add(
+            identDefs(
+                paramName,
+                nimType(paramDef["paramtype"].str)))
+
+    var interfaceName = returnTypeStr
+    interfaceName.removeSuffix("*")
+    interfaceName = interfaceName.strip()
+    if not interfaceVersionStrings.contains(interfaceName):
+        echo "No entry for " & interfaceName & " in " & procName
+
+    args.add(strlit(interfaceVersionStrings[interfaceName]))
+    let call = newCall(procName, args)
+    let statements = newNode(nkStmtList)
+    statements.add(call)
+    newProcDef(procName, returnType, params, statements = statements)
+
+proc createVersionlessMethodWrappers(methodDefs: JsonNode): seq[PNode] =
+    for methodDef in methodDefs:
+        let wrapper = createVersionlessMethodWrapper(methodDef)
+        if wrapper != nil:
+            result.add(wrapper)
+
 proc printTree(ast: PNode, indentLevel: int = 0) =
     var s = ""
     for i in 1 .. indentLevel:
@@ -537,6 +577,9 @@ proc main() =
         for statement in createInterfaceDef(interfaceDef):
             ast.add(statement)
 
+    for statement in createVersionlessMethodWrappers(findISteamClientDef(jsonNode["interfaces"])["methods"]):
+        ast.add(statement)            
+
     let constSection = newNode(nkConstSection)
     ast.add(constSection)
 
@@ -564,30 +607,6 @@ proc main() =
             identDefs("uBuildID", nimType("uint32"))))
 
     ast.add(newImportedProcDef("SteamClient", nimType("ISteamClient *")))
-    let isteamClientDef = findISteamClientDef(jsonNode["interfaces"])
-    for interfaceName, versionString in interfaceVersionStrings:
-        let procName = "Get" & interfacename
-        let flatName = "SteamAPI_ISteamClient_" & procName
-        let params = [
-            identDefs("this", ptrTy(ident("ISteamClient"))),
-            identDefs("hSteamUser", nimType("HSteamUser")),
-            identDefs("hSteamPipe", nimType("HSteamPipe"))]
-
-        let body = newNode(nkStmtList)
-        body.add(
-            newCall(
-                flatName,
-                ident("this"),
-                ident("hSteamUser"),
-                ident("hSteamPipe"),
-                strLit(versionString)))
-
-        ast.add(
-            newProcDef(
-                procName,
-                ptrTy(ident(interfaceName)),
-                params,
-                statements = body))
 
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
