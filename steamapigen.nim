@@ -184,6 +184,11 @@ proc resolveTypedef(typeName: string): string =
     else:
         raise newException(Exception, "Unknown typedef: " & typeName)
 
+proc newTypeSection(typeDefs: varargs[PNode]): PNode =
+    result = newNode(nkTypeSection)
+    for typeDef in typeDefs:
+        result.add(typeDef)
+
 proc newConstDef(name: string, typeDesc: PNode, value: PNode): PNode =
     result = newNode(nkConstDef)
     result.add(exportedIdent(name))
@@ -243,7 +248,7 @@ proc newCall(procName: string, args: varargs[PNode]): PNode =
     for arg in args:
         result.add(arg)
 
-iterator createEnumDef(enumDef: JsonNode, namespace: string = ""): PNode =
+proc createEnumDef(enumDef: JsonNode, namespace: string = ""): seq[PNode] =
     # C++ enums don't follow all restrictions of Nim enums
     # We represent a C++ enum as a distinct int type and a block of constants of that type
     let unqualifiedName = enumDef["enumname"].str
@@ -255,20 +260,18 @@ iterator createEnumDef(enumDef: JsonNode, namespace: string = ""): PNode =
     let values = enumDef["values"]
 
     importedTypes.incl(typeName)
-    yield newDistinctTypeDef(typeName, ident("cint"))
+    result.add(newTypeSection(newTypeDef(typeName, ident("cint"))))
 
     let constSection = newNode(nkConstSection)
     for val in values:
         let constDef = newNode(nkConstDef)
         constDef.add(exportedIdent(val["name"].str))
         constDef.add(ident(typeName))
-        let call = newNode(nkCall)
-        call.add(ident(typeName))
-        call.add(intLit(val["value"].str.parseInt()))
-        constDef.add(call)
+        let intLit = intLit(val["value"].str.parseInt())
+        constDef.add(newCall(typeName, intLit))
         constSection.add(constDef)
 
-    yield constSection
+    result.add(constSection)
 
 proc newPragma(pragmas: varargs[PNode]): PNode =
     result = newNode(nkPragma)
@@ -370,11 +373,6 @@ proc createMethodDef(methodDef: JsonNode, typeName: string): PNode =
 #         body.add(newCall(methodName, args))
 #         let wrapperDef = newProcDef(methodName, returnType, params, empty(), body)
 #         result.add(wrapperDef)
-
-proc newTypeSection(typeDefs: varargs[PNode]): PNode =
-    result = newNode(nkTypeSection)
-    for typeDef in typeDefs:
-        result.add(typeDef)
 
 # Each field is typically an IdentDefs
 proc newObjectTy(fields: varargs[PNode]): PNode =
@@ -606,10 +604,49 @@ proc main() =
             identDefs("pvExceptionInfo", nimType("void *")),
             identDefs("uBuildID", nimType("uint32"))))
 
+    ast.add(
+        newTypeSection(
+            newObjectDef(
+                "CallbackMsg_t",
+                identDefs("steamUser", nimType("HSteamUser")),
+                identDefs("callbackId", nimType("int")),
+                identDefs("pData", ident("pointer")),
+                identDefs("dataSize", nimType("int")))))
+
     ast.add(newImportedProcDef("SteamClient", nimType("ISteamClient *")))
+    ast.add(newImportedProcDef("SteamAPI_ManualDispatch_Init", empty()))
+    ast.add(newImportedProcDef("SteamAPI_ManualDispatch_RunFrame", empty(), identDefs("hSteamPipe", nimType("HSteamPipe"))))
+    ast.add(
+        newImportedProcDef(
+            "SteamAPI_ManualDispatch_GetNextCallback",
+            nimType("bool"),
+            identDefs("hSteamPipe", nimType("HSteamPipe")),
+            identDefs("message", varTy(ident("CallbackMsg_t")))))
+
+    ast.add(newImportedProcDef("SteamAPI_ManualDispatch_FreeLastCallback", empty(), identDefs("hSteamPipe", nimType("HSteamPipe"))))
+    ast.add(
+        newImportedProcDef(
+            "SteamAPI_ManualDispatch_GetAPICallResult",
+            nimType("bool"),
+            identDefs("hSteamPipe", nimType("HSteamPipe")),
+            identDefs("steamApiCall", nimType("SteamAPICall_t")),
+            identDefs("pCallback", ident("pointer")),
+            identDefs("cubCallback", nimType("int")),
+            identDefs("iCallbackExpected", nimType("int")),
+            identDefs("pbFailed", nimType("bool*"))))
 
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
 
+# TODO:
+#   Either make enums not distinct types, or figure out correct types for procs
+#   Different Nim names and C names
+#   Use short names in camel/Pascal case for Nim
+#   Support callback registration
+#   .cimport structs?
+#   Are global accessors like SteamFriends() available in C?
+#   Create getSteamPipe and getSteamUser
+#   Make accessor wrappers take no parameters by getting ISteamClient, HSteamPipe, HSteamUser directly
+#   Investigate caching Steam singletons
 when isMainModule:
     main()
