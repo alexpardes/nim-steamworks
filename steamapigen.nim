@@ -702,9 +702,6 @@ proc main() =
 
 # TODO:
 #   Support callback registration
-#   Are global accessors like SteamFriends() available in C?
-#   Create getSteamPipe and getSteamUser
-#   Make accessor wrappers take no parameters by getting ISteamClient, HSteamPipe, HSteamUser directly
-#   Investigate caching Steam singletons
+#   Create singleton exposing parameterless accessors, cache HSteamPipe, HSteamUser, and possibly interfaces
 when isMainModule:
     main()
