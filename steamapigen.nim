@@ -317,15 +317,48 @@ proc newProcDef(
     result.add(empty()) # Reserved
     result.add(statements)
 
-proc newImportedProcDef(name: string, returnTypeDesc: PNode, params: varargs[PNode]): PNode =
+proc nimName(importedName: string): string =
+    var name = importedName
+    if name.startsWith("operator"):
+        let operator = name[len("operator") .. ^1]
+        if operator == "=":
+            return "assign"
+
+        return "`" & operator & "`"
+
+    name.removePrefix("SteamAPI")
+    var words: seq[string]
+
+    var i = 0
+    for i2, c in name:
+        if c == '_' or c.isUpperAscii() and i2 > 0 and name[i2 - 1].isLowerAscii():
+            if i < i2:
+                words.add(name[i ..< i2].toLowerAscii())
+            if c == '_':
+                i = i2 + 1
+            else:
+                i = i2
+
+    if i <= high(name):
+        words.add(name[i .. ^1].toLowerAscii())
+
+    result = words[0]
+    for word in words[1 .. ^1]:
+        var w = word
+        w[0] = word[0].toUpperAscii()
+        result.add(w)
+
+proc newImportedProcDef(importedName: string, shortName: string, returnTypeDesc: PNode, params: varargs[PNode]): PNode =
     let pragmas = newPragma(
-        ident("importc"),
+        newExprColonExpr(
+            ident("importc"),
+            strlit(importedName)),
         ident("cdecl"),
         newExprColonExpr(
             ident("dynlib"),
             ident("steamworksLib")))
 
-    newProcDef(name, returnTypeDesc, params, pragmas)
+    newProcDef(nimName(shortName), returnTypeDesc, params, pragmas)
 
 proc createMethodDef(methodDef: JsonNode, typeName: string): PNode =
     let thisParam = identDefs("this", ptrTy(nimType(typeName)))
@@ -337,6 +370,7 @@ proc createMethodDef(methodDef: JsonNode, typeName: string): PNode =
 
     newImportedProcDef(
         methodDef["methodname_flat"].str,
+        methodDef["methodname"].str,
         nimType(methodDef["returntype"].str),
         thisParam & paramDefs)
 
@@ -433,6 +467,7 @@ proc createInterfaceDef(interfaceDef: JsonNode): seq[PNode] =
             result.add(
                 newImportedProcDef(
                     accessor["name_flat"].str,
+                    accessor["name"].str,
                     nimType(typeName)))
 
     let enumDefs = interfaceDef{"enums"}
@@ -448,8 +483,8 @@ proc createInterfaceDef(interfaceDef: JsonNode): seq[PNode] =
         result.add(createMethodDef(methodDef, typeName))
 
 proc createVersionlessMethodWrapper(methodDef: JsonNode): PNode =
-    let procName = methodDef["methodname_flat"].str
-    if procName == "SteamAPI_ISteamClient_GetISteamGenericInterface":
+    let procName = nimName(methodDef["methodname"].str)
+    if procName == "getIsteamGenericInterface":
         return nil
 
     let returnTypestr = methodDef["returntype"].str
@@ -595,15 +630,16 @@ proc main() =
             echo "Missing definition for " & typeName
             typeSection.add(newObjectDef(typeName))
 
-    ast.add(newImportedProcDef("SteamAPI_Init", nimType("bool")))
-    ast.add(newImportedProcDef("SteamAPI_ReleaseCurrentThreadMemory", nimType("void")))
-    ast.add(newImportedProcDef("SteamAPI_RestartAppIfNecessary", nimType("bool"), identDefs("unOwnAppID", nimType("uint32"))))
-    ast.add(newImportedProcDef("SteamAPI_RunCallbacks", nimType("void")))
-    ast.add(newImportedProcDef("SteamAPI_SetMiniDumpComment", nimType("void"), identDefs("pchMsg", nimType("const char *"))))
-    ast.add(newImportedProcDef("SteamAPI_Shutdown", nimType("void")))
+    ast.add(newImportedProcDef("SteamAPI_Init", "init", nimType("bool")))
+    ast.add(newImportedProcDef("SteamAPI_ReleaseCurrentThreadMemory", "releaseCurrentThreadMemory", nimType("void")))
+    ast.add(newImportedProcDef("SteamAPI_RestartAppIfNecessary", "restartAppIfNecessary", nimType("bool"), identDefs("unOwnAppID", nimType("uint32"))))
+    ast.add(newImportedProcDef("SteamAPI_RunCallbacks", "runCallbacks", nimType("void")))
+    ast.add(newImportedProcDef("SteamAPI_SetMiniDumpComment", "setMiniDumpComment", nimType("void"), identDefs("pchMsg", nimType("const char *"))))
+    ast.add(newImportedProcDef("SteamAPI_Shutdown", "shutdown", nimType("void")))
     ast.add(
         newImportedProcDef(
             "SteamAPI_WriteMiniDump",
+            "writeMiniDump",
             nimType("void"),
             identDefs("uStructuredExceptionCode", nimType("uint32")),
             identDefs("pvExceptionInfo", nimType("void *")),
@@ -618,20 +654,28 @@ proc main() =
                 identDefs("pData", ident("pointer"), exported = true),
                 identDefs("dataSize", nimType("int"), exported = true))))
 
-    ast.add(newImportedProcDef("SteamClient", nimType("ISteamClient *")))
-    ast.add(newImportedProcDef("SteamAPI_ManualDispatch_Init", empty()))
-    ast.add(newImportedProcDef("SteamAPI_ManualDispatch_RunFrame", empty(), identDefs("hSteamPipe", nimType("HSteamPipe"))))
+    ast.add(newImportedProcDef("SteamClient", "steamClient", nimType("ISteamClient *")))
+    ast.add(newImportedProcDef("SteamAPI_ManualDispatch_Init", "manualDispatchInit", empty()))
+    ast.add(newImportedProcDef("SteamAPI_ManualDispatch_RunFrame", "manualDispatchRunFrame", empty(), identDefs("hSteamPipe", nimType("HSteamPipe"))))
     ast.add(
         newImportedProcDef(
             "SteamAPI_ManualDispatch_GetNextCallback",
+            "manualDispatchGetNextCallback",
             nimType("bool"),
             identDefs("hSteamPipe", nimType("HSteamPipe")),
             identDefs("message", varTy(ident("CallbackMsg_t")))))
 
-    ast.add(newImportedProcDef("SteamAPI_ManualDispatch_FreeLastCallback", empty(), identDefs("hSteamPipe", nimType("HSteamPipe"))))
+    ast.add(
+        newImportedProcDef(
+            "SteamAPI_ManualDispatch_FreeLastCallback",
+            "manualDispatchFreeLastCallback",
+            empty(),
+            identDefs("hSteamPipe", nimType("HSteamPipe"))))
+
     ast.add(
         newImportedProcDef(
             "SteamAPI_ManualDispatch_GetAPICallResult",
+            "manualDispatchGetApiCallResult",
             nimType("bool"),
             identDefs("hSteamPipe", nimType("HSteamPipe")),
             identDefs("steamApiCall", nimType("SteamAPICall_t")),
@@ -648,19 +692,16 @@ proc main() =
             [identDefs("hSteamPipe", nimType("HSteamPipe"))],
             statements = newStmtList(                
                 newVarSection(identDefs("message", ident("CallbackMsg_t"))),
-                newCall("SteamAPI_ManualDispatch_RunFrame", ident("hSteamPipe")),
+                newCall("manualDispatchRunFrame", ident("hSteamPipe")),
                 newWhileStmt(
-                    newCall("SteamAPI_ManualDispatch_GetNextCallback", ident("hSteamPipe"), ident("message")),
-                    newCall("SteamAPI_ManualDispatch_FreeLastCallback", ident("hSteamPipe"))))))
+                    newCall("manualDispatchGetNextCallback", ident("hSteamPipe"), ident("message")),
+                    newCall("manualDispatchFreeLastCallback", ident("hSteamPipe"))))))
 
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
 
 # TODO:
-#   Different Nim names and C names
-#   Use short names in camel/Pascal case for Nim
 #   Support callback registration
-#   .cimport structs?
 #   Are global accessors like SteamFriends() available in C?
 #   Create getSteamPipe and getSteamUser
 #   Make accessor wrappers take no parameters by getting ISteamClient, HSteamPipe, HSteamUser directly
