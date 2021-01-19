@@ -3,11 +3,6 @@ import json, tables, sets, strutils, os, sugar
 
 let jsonPath = "../steamworks-sdk/public/steam/steam_api.json"  
 
-when system.hostOS == "windows":
-    let libPath = "win64/steam_api64.dll"
-elif system.hostOS == "linux":
-    let libPath = "linux64/libsteam_api.so"
-
 let identCache = newIdentCache()
 let typeMap = {
     "bool": "bool",
@@ -88,6 +83,12 @@ proc exportedIdent(name: string): PNode =
     result.add(ident("*"))
     result.add(ident(name))
 
+proc newElifBranch(condition: PNode, statements: varargs[PNode]): PNode =
+    newNode(nkElifBranch, condition & @statements)
+
+proc newInfix(operator: string, left: PNode, right: PNode): PNode =
+    newNode(nkInfix, ident(operator), left, right)
+
 proc newBracketExpr(typeName: string, params: varargs[PNode]): PNode =
     result = newNode(nkBracketExpr)
     result.add(ident(typeName))
@@ -104,13 +105,13 @@ proc arrayType(typeStr: string): PNode =
     else:
         nil
 
-proc identDefs(name: string, typeDesc: PNode, defaultValue: PNode = empty()): PNode =
+proc identDefs(name: string, typeDesc: PNode, defaultValue: PNode = empty(), exported: bool = false): PNode =
     var name = name
     if name in ["addr", "type"]:
         name &= '1'
 
     result = newNode(nkIdentDefs)
-    result.add(ident(name))
+    result.add(if exported: exportedIdent(name) else: ident(name))
     result.add(typeDesc)
     result.add(defaultValue)
 
@@ -249,7 +250,7 @@ proc newDistinctTypeDef(typeName: string, typeDesc: PNode): PNode =
     result = newNode(nkTypeSection)
     let typeDef = newNode(nkTypeDef)
     result.add(typeDef)
-    typeDef.add(ident(typeName))
+    typeDef.add(exportedIdent(typeName))
     typeDef.add(empty())
     let distinctTy = newNode(nkDistinctTy)
     distinctTy.add(typeDesc)
@@ -401,7 +402,8 @@ proc createStructDef(typeName: string, structDef: JsonNode): seq[PNode] =
         recList.add(
             identDefs(
                 fieldDef["fieldname"].str,
-                nimType(fieldDef["fieldtype"].str)))
+                nimType(fieldDef["fieldtype"].str),
+                exported = true))
 
     let enumDefs = structDef{"enums"}
     if not enumDefs.isNil:
@@ -546,11 +548,14 @@ proc main() =
     ast.add(newNode(nkImportStmt, ident("tables")))
 
     ast.add(
-        newConstSection(
-            newConstDef(
-                "steamworksLib",
-                empty(),
-                strLit(libPath))))
+        newNode(
+            nkWhenStmt,
+            newElifBranch(
+                newInfix("==", newNode(nkDotExpr, ident("system"), ident("hostOS")), strlit("windows")),
+                newConstSection(newConstDef("steamworksLib", empty(), strlit("win64/steam_api64.dll")))),
+            newElifBranch(
+                newInfix("==", newNode(nkDotExpr, ident("system"), ident("hostOS")), strlit("linux")),
+                newConstSection(newConstDef("steamworksLib", empty(), strlit("linux64/libsteam_api.so"))))))
 
     ast.add(newDistinctTypeDef("CSteamID", ident("uint64")))
     importedTypes.incl("CSteamID")
@@ -608,10 +613,10 @@ proc main() =
         newTypeSection(
             newObjectDef(
                 "CallbackMsg_t",
-                identDefs("steamUser", nimType("HSteamUser")),
-                identDefs("callbackId", nimType("int")),
-                identDefs("pData", ident("pointer")),
-                identDefs("dataSize", nimType("int")))))
+                identDefs("steamUser", nimType("HSteamUser"), exported = true),
+                identDefs("callbackId", nimType("int"), exported = true),
+                identDefs("pData", ident("pointer"), exported = true),
+                identDefs("dataSize", nimType("int"), exported = true))))
 
     ast.add(newImportedProcDef("SteamClient", nimType("ISteamClient *")))
     ast.add(newImportedProcDef("SteamAPI_ManualDispatch_Init", empty()))
@@ -656,7 +661,6 @@ proc main() =
 #   Use short names in camel/Pascal case for Nim
 #   Support callback registration
 #   .cimport structs?
-#   Move when statements into generated code
 #   Are global accessors like SteamFriends() available in C?
 #   Create getSteamPipe and getSteamUser
 #   Make accessor wrappers take no parameters by getting ISteamClient, HSteamPipe, HSteamUser directly
