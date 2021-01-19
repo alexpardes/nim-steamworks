@@ -39,6 +39,17 @@ var unknownTypes: HashSet[string]
 var typedefMap: Table[string, string]
 var interfaceVersionStrings: Table[string, string]
 
+# Map from callback id to callback struct name
+var callbackIds: Table[int, string]
+
+proc addAll(node: PNode, children: varargs[PNode]) =
+    for child in children:
+        node.add(child)
+
+proc newNode(kind: TNodeKind, children: varargs[PNode]): PNode =
+    result = ast.newNode(kind)
+    result.addAll(children)
+
 proc empty(): Pnode = newNode(nkEmpty)
 
 proc strLit(str: string): Pnode =
@@ -77,11 +88,13 @@ proc exportedIdent(name: string): PNode =
     result.add(ident("*"))
     result.add(ident(name))
 
-proc arrayType(typeName: string, length: int): PNode =
+proc newBracketExpr(typeName: string, params: varargs[PNode]): PNode =
     result = newNode(nkBracketExpr)
-    result.add(ident("array"))
-    result.add(intLit(length))
-    result.add(nimType(typeName))
+    result.add(ident(typeName))
+    result.addAll(params)
+
+proc arrayType(typeName: string, length: int): PNode =
+    newBracketExpr("array", intLit(length), nimType(typeName))
 
 proc arrayType(typeStr: string): PNode =
     let parsed = typeStr.split({'[', ']'})
@@ -107,9 +120,7 @@ proc procType(returnTypeStr: string, paramTypeNames: openArray[string]): PNode =
     for i, typeName in paramTypeNames:
         params.add(identDefs("arg" & $i, nimType(typeName)))
 
-    result = newNode(nkProcTy)
-    result.add(params)
-    result.add(empty())
+    newNode(nkProcTy, params, empty())
 
 proc procType(typeStr: string): PNode =
     # e.g.
@@ -184,16 +195,18 @@ proc resolveTypedef(typeName: string): string =
     else:
         raise newException(Exception, "Unknown typedef: " & typeName)
 
+proc newStmtList(statements: varargs[PNode]): PNode =
+    result = newNode(nkStmtList, statements)
+
 proc newTypeSection(typeDefs: varargs[PNode]): PNode =
-    result = newNode(nkTypeSection)
-    for typeDef in typeDefs:
-        result.add(typeDef)
+    result = newNode(nkTypeSection, typeDefs)
 
 proc newConstDef(name: string, typeDesc: PNode, value: PNode): PNode =
-    result = newNode(nkConstDef)
-    result.add(exportedIdent(name))
-    result.add(typeDesc)
-    result.add(value)
+    newNode(
+        nkConstDef,
+        exportedIdent(name),
+        typeDesc,
+        value)
 
 proc newConstDef(name: string, typeName: string, valueExpr: PNode): PNode =
     let castNode = newNode(nkCast)
@@ -209,6 +222,11 @@ proc createConstDef(constDef: JsonNode, valueExpr: PNode): PNode =
         constDef["constname"].str,
         constDef["consttype"].str,
         valueExpr)
+
+proc newWhileStmt(condition: PNode, statements: varargs[PNode]): PNode =
+    result = newNode(nkWhileStmt)
+    result.add(condition)
+    result.add(newStmtList(statements))
 
 proc newTypeDef(name: string, typeDesc: PNode): PNode =
     importedTypes.incl(name)
@@ -238,15 +256,16 @@ proc newDistinctTypeDef(typeName: string, typeDesc: PNode): PNode =
     typeDef.add(distinctTy)
 
 proc newConstSection(constDefs: varargs[PNode]): PNode =
-    result = newNode(nkConstSection)
-    for constDef in constDefs:
-        result.add(constDef)
+    newNode(nkConstSection, constDefs)
+
+proc newLetSection(identDefs: varargs[PNode]): PNode =
+    newNode(nkLetSection, identDefs)
+
+proc newVarSection(identDefs: varargs[PNode]): PNode =
+    newNode(nkVarSection, identDefs)
 
 proc newCall(procName: string, args: varargs[PNode]): PNode =
-    result = newNode(nkCall)
-    result.add(ident(procName))
-    for arg in args:
-        result.add(arg)
+    newNode(nkCall, ident(procName) & @args)
 
 proc createEnumDef(enumDef: JsonNode, namespace: string = ""): seq[PNode] =
     # C++ enums don't follow all restrictions of Nim enums
@@ -274,14 +293,10 @@ proc createEnumDef(enumDef: JsonNode, namespace: string = ""): seq[PNode] =
     result.add(constSection)
 
 proc newPragma(pragmas: varargs[PNode]): PNode =
-    result = newNode(nkPragma)
-    for pragma in pragmas:
-        result.add(pragma)
+    result = newNode(nkPragma, pragmas)
 
 proc newExprColonExpr(a: PNode, b: PNode): Pnode =
-    result = newNode(nkExprColonExpr)
-    result.add(a)
-    result.add(b)
+    result = newNode(nkExprColonExpr, a, b)
 
 proc newProcDef(
     name: string,
@@ -291,11 +306,7 @@ proc newProcDef(
     statements: PNode = empty()
 ): PNode =
 
-    let formalParams = newNode(nkFormalParams)
-    formalParams.add(returnType)
-    for param in params:
-        formalParams.add(param)
-
+    let formalParams = newNode(nkFormalParams, returnType & @params)
     result = newNode(nkProcDef)
     result.add(exportedIdent(name))
     result.add(empty()) # Only used for macros
@@ -379,12 +390,7 @@ proc newObjectTy(fields: varargs[PNode]): PNode =
     result = newNode(nkObjectTy)
     result.add(empty()) # Pragmas
     result.add(empty()) # Base object
-
-    let recList = newNode(nkRecList)
-    for field in fields:
-        recList.add(field)
-
-    result.add(recList)
+    result.add(newNode(nkRecList, fields))
 
 proc newObjectDef(name: string, fields: varargs[PNode]): PNode =
     newTypeDef(name, newObjectTy(fields))
@@ -400,8 +406,7 @@ proc createStructDef(typeName: string, structDef: JsonNode): seq[PNode] =
     let enumDefs = structDef{"enums"}
     if not enumDefs.isNil:
         for enumDef in enumDefs:
-            for node in createEnumDef(enumDef, typeName):
-                result.add(node)
+            result.add(createEnumDef(enumDef, typeName))
 
     let objectTy = newNode(nkObjectTy)
     objectTy.add(empty())
@@ -431,8 +436,7 @@ proc createInterfaceDef(interfaceDef: JsonNode): seq[PNode] =
     let enumDefs = interfaceDef{"enums"}
     if not enumDefs.isNil:
         for enumDef in enumDefs:
-            for node in createEnumDef(enumDef, typeName):
-                result.add(node)
+            result.add(createEnumDef(enumDef, typeName))
 
     let versionNode = interfaceDef{"version_string"}
     if not versionNode.isNil:
@@ -533,13 +537,13 @@ proc findISteamClientDef(interfaceDefs: JsonNode): JsonNode =
 proc main() =
     let jsonNode = parseFile(jsonPath)
     let ast = newNode(nkStmtList)
+    ast.add(
+        newPragma(
+            newExprColonExpr(
+                ident("experimental"),
+                strLit("codeReordering"))))
 
-    let colonExpr = newNode(nkExprColonExpr)
-    colonExpr.add(ident("experimental"))
-    colonExpr.add(strLit("codeReordering"))
-    let pragma = newNode(nkPragma)
-    pragma.add(colonExpr)
-    ast.add(pragma)
+    ast.add(newNode(nkImportStmt, ident("tables")))
 
     ast.add(
         newConstSection(
@@ -554,8 +558,7 @@ proc main() =
     importedTypes.incl("CGameID")
 
     for enumDef in jsonNode["enums"]:
-        for statement in createEnumDef(enumDef):
-            ast.add(statement)
+        ast.addAll(createEnumDef(enumDef))
 
     let typeSection = newNode(nkTypeSection)
     ast.add(typeSection)
@@ -564,19 +567,16 @@ proc main() =
         typeSection.add(createTypedef(typedef))
 
     for structDef in jsonNode["structs"]:
-        for statement in createStructDef(structDef):
-            ast.add(statement)
+        ast.addAll(createStructDef(structDef))
 
     for structDef in jsonNode["callback_structs"]:
-        for statement in createStructDef(structDef):
-            ast.add(statement)
+        callbackIds[structDef["callback_id"].getInt()] = structDef["struct"].str
+        ast.addAll(createStructDef(structDef))
 
     for interfaceDef in jsonNode["interfaces"]:
-        for statement in createInterfaceDef(interfaceDef):
-            ast.add(statement)
+        ast.addAll(createInterfaceDef(interfaceDef))
 
-    for statement in createVersionlessMethodWrappers(findISteamClientDef(jsonNode["interfaces"])["methods"]):
-        ast.add(statement)            
+    ast.addAll(createVersionlessMethodWrappers(findISteamClientDef(jsonNode["interfaces"])["methods"]))
 
     let constSection = newNode(nkConstSection)
     ast.add(constSection)
@@ -635,15 +635,28 @@ proc main() =
             identDefs("iCallbackExpected", nimType("int")),
             identDefs("pbFailed", nimType("bool*"))))
 
+    # ast.add(newVarSection(identDefs("callbackTable", newBracketExpr("Table", ident("int"), ident("")))))
+    ast.add(
+        newProcDef(
+            "runSteamFrame",
+            empty(),
+            [identDefs("hSteamPipe", nimType("HSteamPipe"))],
+            statements = newStmtList(                
+                newVarSection(identDefs("message", ident("CallbackMsg_t"))),
+                newCall("SteamAPI_ManualDispatch_RunFrame", ident("hSteamPipe")),
+                newWhileStmt(
+                    newCall("SteamAPI_ManualDispatch_GetNextCallback", ident("hSteamPipe"), ident("message")),
+                    newCall("SteamAPI_ManualDispatch_FreeLastCallback", ident("hSteamPipe"))))))
+
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
 
 # TODO:
-#   Either make enums not distinct types, or figure out correct types for procs
 #   Different Nim names and C names
 #   Use short names in camel/Pascal case for Nim
 #   Support callback registration
 #   .cimport structs?
+#   Move when statements into generated code
 #   Are global accessors like SteamFriends() available in C?
 #   Create getSteamPipe and getSteamUser
 #   Make accessor wrappers take no parameters by getting ISteamClient, HSteamPipe, HSteamUser directly
