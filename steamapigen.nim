@@ -1,5 +1,5 @@
 import compiler/[ast, idents, renderer, lineinfos, parser, options]
-import json, tables, sets, strutils, os, sugar
+import json, tables, sets, strutils, os, sugar, algorithm
 
 let jsonPath = "../steamworks-sdk/public/steam/steam_api.json"  
 
@@ -83,8 +83,14 @@ proc exportedIdent(name: string): PNode =
     result.add(ident("*"))
     result.add(ident(name))
 
+proc newDotExpr(a: PNode, b: PNode): PNode =
+    newNode(nkDotExpr, a, b)
+
 proc newElifBranch(condition: PNode, statements: varargs[PNode]): PNode =
     newNode(nkElifBranch, condition & @statements)
+
+proc newOfBranch(condition: PNode, content: PNode): PNode =
+    newNode(nkOfBranch, condition, content)
 
 proc newInfix(operator: string, left: PNode, right: PNode): PNode =
     newNode(nkInfix, ident(operator), left, right)
@@ -114,6 +120,12 @@ proc identDefs(name: string, typeDesc: PNode, defaultValue: PNode = empty(), exp
     result.add(if exported: exportedIdent(name) else: ident(name))
     result.add(typeDesc)
     result.add(defaultValue)
+
+proc newProcTy(returnType: PNode, params: varargs[PNode]): PNode =    
+    newNode(
+        nkProcTy,
+        newNode(nkFormalParams, returnType & @params),
+        empty())
 
 proc procType(returnTypeStr: string, paramTypeNames: openArray[string]): PNode =
     let params = newNode(nkFormalParams)
@@ -427,8 +439,15 @@ proc newObjectTy(fields: varargs[PNode]): PNode =
     result.add(empty()) # Base object
     result.add(newNode(nkRecList, fields))
 
+proc newRecCase(identDefs: PNode, branches: varargs[PNode]): PNode =
+    result = newNode(nkRecCase, identDefs)
+    result.addAll(branches)
+
 proc newObjectDef(name: string, fields: varargs[PNode]): PNode =
     newTypeDef(name, newObjectTy(fields))
+
+proc newRefObjectDef(name: string, fields: varargs[PNode]): PNode =
+    newTypeDef(name, newNode(nkRefTy, newObjectTy(fields)))
 
 proc createStructDef(typeName: string, structDef: JsonNode): seq[PNode] =
     let recList = newNode(nkRecList)
@@ -571,6 +590,83 @@ proc findISteamClientDef(interfaceDefs: JsonNode): JsonNode =
         if def["classname"].str == "ISteamClient":
             return def
 
+proc callbackNameFromStructName(structName: string): string =
+    result = structName
+    result.removeSuffix("_t")
+    result[0] = result[0].toLowerAscii()
+
+proc createCallbackEnumDef(): PNode =
+    let enumNode = newNode(nkEnumTy, empty())
+    var values: seq[(int, string)] = collect(newSeq):
+        for pair in callbackIds.pairs:
+            pair
+    
+    values.sort((a, b) => cmp(a[0], b[0]))
+    for value in values:
+        let name = callbackNameFromStructName(value[1])
+        enumNode.add(newNode(nkEnumFieldDef, ident(name), intLit(value[0])))
+
+    newTypeSection(newTypeDef("CallbackType", enumNode))
+
+proc hanlderNameFromCallbackStructName(callbackName: string): string =
+    callbackNameFromStructName(callbackName) & "Handler"
+
+proc procTyFromCallbackStructName(structName: string): PNode =
+    newProcTy(empty(), identDefs("data", ptrTy(ident(structName))))
+
+proc createSteamSingleton(): PNode =
+    let fields = collect(newSeq):
+        for structName in callbackIds.values:
+            let fieldName = hanlderNameFromCallbackStructName(structName)            
+            identDefs(fieldName, procTyFromCallbackStructName(structName))
+
+    newTypeSection(newRefObjectDef("Steam", fields))
+
+proc createCallbackRegistrationDefs(): seq[PNode] =
+    for structName in callbackIds.values:
+        let handlerType = newProcTy(empty(), identDefs("data", ptrTy(ident(structName))))
+        let params = [
+            identDefs("steam", ident("Steam")),
+            identDefs("handler", handlerType)]
+
+        let handlerName = hanlderNameFromCallbackStructName(structName)
+        let statements = newStmtList(
+            newNode(
+                nkAsgn,
+                newDotExpr(ident("steam"), ident(handlerName)),
+                ident("handler")))
+
+        result.add(
+            newProcDef(
+                "registerHandler",
+                empty(),
+                params,
+                statements = statements))
+ 
+proc createCallbackHandlerDef(): PNode =
+    let params = [
+        identDefs("steam", ident("Steam")),
+        identDefs("message", ident("CallbackMsg_t"))]
+
+    let caseStmt = newNode(nkCaseStmt, newDotExpr(ident("message"), ident("callbackId")))
+    for id, structName in callbackIds:
+        let handlerName = hanlderNameFromCallbackStructName(structName)
+        let dataNode = newNode(
+            nkCast,
+            ptrTy(ident(structName)),
+            newDotExpr(ident("message"), ident("pData")))
+
+        let call = newNode(nkCall, newDotExpr(ident("steam"), ident(handlerName)), dataNode)
+        caseStmt.add(newOfBranch(intLit(id), call))
+
+    caseStmt.add(newNode(nkElse, newNode(nkDiscardStmt, empty())))
+    let statements = newStmtList(caseStmt)
+    newProcDef(
+        "handleCallback",
+        empty(), 
+        params,
+        statements = statements)
+
 proc main() =
     let jsonNode = parseFile(jsonPath)
     let ast = newNode(nkStmtList)
@@ -586,10 +682,10 @@ proc main() =
         newNode(
             nkWhenStmt,
             newElifBranch(
-                newInfix("==", newNode(nkDotExpr, ident("system"), ident("hostOS")), strlit("windows")),
+                newInfix("==", newDotExpr(ident("system"), ident("hostOS")), strlit("windows")),
                 newConstSection(newConstDef("steamworksLib", empty(), strlit("win64/steam_api64.dll")))),
             newElifBranch(
-                newInfix("==", newNode(nkDotExpr, ident("system"), ident("hostOS")), strlit("linux")),
+                newInfix("==", newDotExpr(ident("system"), ident("hostOS")), strlit("linux")),
                 newConstSection(newConstDef("steamworksLib", empty(), strlit("linux64/libsteam_api.so"))))))
 
     ast.add(newDistinctTypeDef("CSteamID", ident("uint64")))
@@ -684,17 +780,23 @@ proc main() =
             identDefs("iCallbackExpected", nimType("int")),
             identDefs("pbFailed", nimType("bool*"))))
 
-    # ast.add(newVarSection(identDefs("callbackTable", newBracketExpr("Table", ident("int"), ident("")))))
+    # ast.add(createCallbackEnumDef())
+    ast.add(createSteamSingleton())
+    ast.addAll(createCallbackRegistrationDefs())
+    ast.add(createCallbackHandlerDef())
     ast.add(
         newProcDef(
-            "runSteamFrame",
+            "runFrame",
             empty(),
-            [identDefs("hSteamPipe", nimType("HSteamPipe"))],
+            [
+                identDefs("steam", ident("Steam")),
+                identDefs("hSteamPipe", nimType("HSteamPipe"))],
             statements = newStmtList(                
                 newVarSection(identDefs("message", ident("CallbackMsg_t"))),
                 newCall("manualDispatchRunFrame", ident("hSteamPipe")),
                 newWhileStmt(
                     newCall("manualDispatchGetNextCallback", ident("hSteamPipe"), ident("message")),
+                    newCall("handleCallback", ident("steam"), ident("message")),
                     newCall("manualDispatchFreeLastCallback", ident("hSteamPipe"))))))
 
     createDir("gen")
