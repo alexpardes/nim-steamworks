@@ -657,7 +657,10 @@ proc createCallbackHandlerDef(): PNode =
             newDotExpr(ident("message"), ident("pData")))
 
         let call = newNode(nkCall, newDotExpr(ident("steam"), ident(handlerName)), dataNode)
-        caseStmt.add(newOfBranch(intLit(id), call))
+        caseStmt.add(
+            newOfBranch(
+                intLit(id),
+                newStmtList(call)))
 
     caseStmt.add(newNode(nkElse, newNode(nkDiscardStmt, empty())))
     let statements = newStmtList(caseStmt)
@@ -802,8 +805,5 @@ proc main() =
     createDir("gen")
     writeFile("gen/steamworks.nim", renderTree(ast))
 
-# TODO:
-#   Support callback registration
-#   Create singleton exposing parameterless accessors, cache HSteamPipe, HSteamUser, and possibly interfaces
 when isMainModule:
     main()
