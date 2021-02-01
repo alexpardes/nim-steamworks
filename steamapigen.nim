@@ -1,7 +1,7 @@
 import compiler/[ast, idents, renderer, lineinfos, parser, options]
 import json, tables, sets, strutils, os, sugar, algorithm
 
-let jsonPath = "../steamworks-sdk/public/steam/steam_api.json"  
+let jsonPath = "C:/lib/steamworks-150/public/steam/steam_api.json"
 
 let identCache = newIdentCache()
 let typeMap = {
@@ -121,7 +121,7 @@ proc identDefs(name: string, typeDesc: PNode, defaultValue: PNode = empty(), exp
     result.add(typeDesc)
     result.add(defaultValue)
 
-proc newProcTy(returnType: PNode, params: varargs[PNode]): PNode =    
+proc newProcTy(returnType: PNode, params: varargs[PNode]): PNode =
     newNode(
         nkProcTy,
         newNode(nkFormalParams, returnType & @params),
@@ -487,7 +487,7 @@ proc createInterfaceDef(interfaceDef: JsonNode): seq[PNode] =
                 newImportedProcDef(
                     accessor["name_flat"].str,
                     accessor["name"].str,
-                    nimType(typeName)))
+                    nimType(typeName & "*")))
 
     let enumDefs = interfaceDef{"enums"}
     if not enumDefs.isNil:
@@ -600,7 +600,7 @@ proc createCallbackEnumDef(): PNode =
     var values: seq[(int, string)] = collect(newSeq):
         for pair in callbackIds.pairs:
             pair
-    
+
     values.sort((a, b) => cmp(a[0], b[0]))
     for value in values:
         let name = callbackNameFromStructName(value[1])
@@ -617,7 +617,7 @@ proc procTyFromCallbackStructName(structName: string): PNode =
 proc createSteamSingleton(): PNode =
     let fields = collect(newSeq):
         for structName in callbackIds.values:
-            let fieldName = hanlderNameFromCallbackStructName(structName)            
+            let fieldName = hanlderNameFromCallbackStructName(structName)
             identDefs(fieldName, procTyFromCallbackStructName(structName))
 
     newTypeSection(newRefObjectDef("Steam", fields))
@@ -642,7 +642,7 @@ proc createCallbackRegistrationDefs(): seq[PNode] =
                 empty(),
                 params,
                 statements = statements))
- 
+
 proc createCallbackHandlerDef(): PNode =
     let params = [
         identDefs("steam", ident("Steam")),
@@ -666,7 +666,7 @@ proc createCallbackHandlerDef(): PNode =
     let statements = newStmtList(caseStmt)
     newProcDef(
         "handleCallback",
-        empty(), 
+        empty(),
         params,
         statements = statements)
 
@@ -686,10 +686,10 @@ proc main() =
             nkWhenStmt,
             newElifBranch(
                 newInfix("==", newDotExpr(ident("system"), ident("hostOS")), strlit("windows")),
-                newConstSection(newConstDef("steamworksLib", empty(), strlit("win64/steam_api64.dll")))),
+                newConstSection(newConstDef("steamworksLib", empty(), strlit("steam_api64.dll")))),
             newElifBranch(
                 newInfix("==", newDotExpr(ident("system"), ident("hostOS")), strlit("linux")),
-                newConstSection(newConstDef("steamworksLib", empty(), strlit("linux64/libsteam_api.so"))))))
+                newConstSection(newConstDef("steamworksLib", empty(), strlit("libsteam_api.so"))))))
 
     ast.add(newDistinctTypeDef("CSteamID", ident("uint64")))
     importedTypes.incl("CSteamID")
@@ -794,7 +794,7 @@ proc main() =
             [
                 identDefs("steam", ident("Steam")),
                 identDefs("hSteamPipe", nimType("HSteamPipe"))],
-            statements = newStmtList(                
+            statements = newStmtList(
                 newVarSection(identDefs("message", ident("CallbackMsg_t"))),
                 newCall("manualDispatchRunFrame", ident("hSteamPipe")),
                 newWhileStmt(
